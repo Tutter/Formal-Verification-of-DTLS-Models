@@ -1,0 +1,535 @@
+theory psk_handshake
+begin
+
+builtins: hashing, diffie-hellman, symmetric-encryption, asymmetric-encryption, signing, natural-numbers
+
+functions: HKDFExpand/1, hmac/1, h1/1
+
+macros: handshakeCryptoHeader() = </*first three bits*/ <'0','0','1'>, /*C*/ '0', /*S*/ '1', /*L*/ '1', /*E*/ <'1','0'>>,
+        protocolVersion() = <'254', '253'>
+
+// Adversary power
+rule Reveal_DHExp:
+  [ DHExp(~x, ~tid, $A) ] --[ RevDHExp(~x, ~tid, $A), Corrupt($A) ]-> [ Out(~x) ]
+
+/* Channel rules */
+rule Secure_Chan:
+    [ S_Out(m) ]
+  --[ ]->
+    [ S_In(m) ]
+
+rule ClientHelloPsk:
+  let
+    ClientHello = 
+      < /*ProtocolVersion*/ protocolVersion(), 
+        /*Random32*/ ~session_id, 
+        /*CipherSuite*/ 'CipherSuits', 
+        /*Extension*/ <
+          /*ExtensionType*/ '41', 
+          /*PreSharedKeyExtension*/ <
+            /*OfferedPsks*/ <~psk_id_1> 
+          >,
+          /*ExtensionType*/ '45', 
+          /*PskKeyExchangeModes*/ <
+            /*PskKeyExchangeMode*/ <'1' /*psk_dhe_ke(1)*/> 
+            >,
+          /*ExtensionType*/ '51', 
+          /*KeyshareClientHello*/ <
+            /*KeyshareEntry*/ <'g', 'g'^~a>
+          >
+        >
+      >
+
+    DTLSPlaintext = 
+      <
+        /*ContentType*/ '22',
+        /*epoch*/ 1:nat,
+        /*sequence_number*/ 1:nat,
+        /*length*/ ~msg_len,
+        <
+          /*HandshakeType*/ '1', /*client_hello(1)*/
+          <~msg_len, 1:nat, 1:nat, 1:nat>,
+          ClientHello
+        >
+      >
+  in
+    [ Fr(~psk_id_1),
+      Fr(~psk_1),
+      Fr(~session_id),
+      Fr(~a),
+      Fr(~msg_len) ]
+  --[ DH(~a, ~session_id, $C),
+      Start($C, $S, 'client', ~session_id) ]->
+    [ S_Out(<$C, $S, <~psk_id_1, ~psk_1>>),
+      Out(<$C, $S, DTLSPlaintext>), /*clienthello plaintext*/
+      St_ClientHello(<$C, $S, <~a, ~psk_1>, ~session_id>, <<'1', ClientHello>>, <~session_id, 1:nat, 1:nat %+ 1:nat, 1:nat, 1:nat>),
+      DHExp(~a, ~session_id, $C) ]
+
+rule ServerHello:
+  let
+    /************ INCOMMING: CLIENTHELLO **************/
+    ClientHello = 
+      < /*ProtocolVersion*/ protocolVersion(), 
+        /*Random32*/ client_session_id, 
+        /*CipherSuite*/ 'CipherSuits', 
+        /*Extension*/ <
+          /*ExtensionType*/ '41', 
+          /*PreSharedKeyExtension*/ <
+            /*OfferedPsks*/ <psk_id_1> 
+          >,
+          /*ExtensionType*/ '45', 
+          /*PskKeyExchangeModes*/ <
+            /*PskKeyExchangeMode*/ <'1' /*psk_dhe_ke(1)*/> 
+            >,
+          /*ExtensionType*/ '51', 
+          /*KeyshareClientHello*/ <
+            /*KeyshareEntry*/ <'g', ga>
+          >
+        >
+      >
+
+    DTLSPlaintext = 
+      <
+        /*ContentType*/ '22',
+        /*epoch*/ 1:nat,
+        /*sequence_number*/ 1:nat,
+        /*length*/ lenCH,
+        <
+          /*HandshakeType*/ '1', /*client_hello(1)*/
+          <lenCH, 1:nat, 1:nat, 1:nat>,
+          ClientHello
+        >
+      >
+    /********************************************/
+    traffic_key = <ga^~b, psk_1>
+    /*************** SERVERHELLO ****************/
+    ServerHello = 
+      <
+        /*ProtocolVersion*/ protocolVersion(), 
+        /*Random32*/ ~session_id, 
+        /*CipherSuite*/ 'CipherSuits', 
+        /*Extension*/ <
+          /*ExtensionType*/ '41', 
+          /*PreSharedKeyExtension*/ <
+            /*PskIdentity*/ <psk_id_1, ~obfuscated_ticket_age> 
+            >,
+          /*ExtensionType*/ '51', 
+          /*KeyshareServerHello*/ <'g', 'g'^~b>
+        >
+      >
+
+    DTLSPlaintextSH = 
+      <
+        /*ContentType*/ '22',
+        /*epoch*/ 1:nat,
+        /*sequence_number*/ 1:nat,
+        /*length*/ ~msg_len,
+        <
+          /*HandshakeType*/ '2', /*server_hello(2)*/
+          <~msg_len, 1:nat, 1:nat, 1:nat>,
+          ServerHello
+        >
+      >
+
+    /********************************************/
+  in
+    [ Fr(~obfuscated_ticket_age),
+      Fr(~session_id),
+      Fr(~b),
+      Fr(~msg_len),
+      S_In(<$C, $S, <psk_id_1, psk_1>>),
+      In(<$C, $S, DTLSPlaintext>) ]
+  --[ Neq('g', ga), Neq(ga, ga^~b), /* Ensure gb is not DH_Neutral */
+      DHChal($S, ~session_id, 'g', ~b, ga, 'g'^~b, ga^~b),
+      DH(~b, ~session_id, $S),
+      Start($S, $C, 'server', ~session_id),
+      Reach('SH') ]->
+    [ Out(<$S, $C, DTLSPlaintextSH>),
+      !Keys(<$S, $C, ~session_id, 'g'^~b, ga, traffic_key>),
+      St_ServerHello(<$S, $C, <<'1', ClientHello>, <'2', ServerHello>>>, <psk_id_1, psk_1>, <client_session_id, ~session_id>, <~session_id, 1:nat, 1:nat %+ 1:nat, 1:nat, 1:nat %+ 1:nat>),
+      DHExp(~b, ~session_id, $S) ]
+      
+
+// EncryptedExtensions
+rule EncryptedExtensions:
+  let
+    /********** ENCRYPTEDEXTENSION **********/
+    EncryptedExtensions = 
+      <
+        /*Extension*/ <
+            /*ExtensionType*/ '13', 
+            /*EncryptedExtensions*/ 'encryptedExtensions'
+        >
+      >
+
+    DTLSCipherTextEE = 
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc{<
+          /*content*/ <
+            /*HandshakeType*/ '8', /*encrypted_extensions(8)*/
+            <~msg_len, %next_seq, 1:nat, 1:nat>, 
+            EncryptedExtensions
+          >, 
+          /*zeros*/ <'0'>, 
+          /*ContentType*/ '22'
+        >}traffic_key
+      >
+    /******************************/
+  in
+      [ Fr(~msg_len),
+        St_ServerHello(<$S, $C, <ClientHello, ServerHello>>, <psk_id_1, psk_1>, nonce, <session_id, %next_seq, %next_epoch, %rec_seq, %rec_epoch>),
+        !Keys(<$S, $C, session_id, gb, ga, traffic_key>) ]
+    --[ Instance(session_id, $S, 'server'),
+        Send($S, $C, 'EE', session_id), Reach('EE') ]->
+      [ Out(<$S, $C, DTLSCipherTextEE>) /*encryptedextensions encrypted*/,
+        St_EncryptedExtensions(<$S, $C, <ClientHello, ServerHello, <'8', EncryptedExtensions>>>, <psk_id_1, psk_1>, nonce, <session_id, %next_seq %+ 1:nat, %next_epoch, %rec_seq, %rec_epoch>) ]
+
+// ServerFinished
+rule ServerFinished:
+  let
+    /********** SERVERFINISHED **********/
+    finished_key =  HKDFExpand(<traffic_key, 'finished', 'Hash_length'>)
+
+    ServerFinished = 
+      <
+        /*verify_data*/  hmac(<finished_key, 
+                              h1(<ClientHello, ServerHello, EncryptedExtensions>)>)
+      >
+
+    DTLSCipherTextSF = 
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc(<
+          /*content*/ <
+            /*HandshakeType*/ '20', /*finished(20)*/
+            <~msg_len, %next_seq, 1:nat, 1:nat>, 
+            ServerFinished
+          >, 
+          /*zeros*/ <'0'>, 
+          /*ContentType*/ '22'
+        >, traffic_key)
+      >
+    /******************************/
+  in
+      [ Fr(~msg_len),
+        St_EncryptedExtensions(<$S, $C, <ClientHello, ServerHello, EncryptedExtensions>>, <psk_id_1, psk_1>, nonce, <session_id, %next_seq, %next_epoch, %rec_seq, %rec_epoch>),
+        !Keys(<$S, $C, session_id, gb, ga, traffic_key>) ]
+    --[ Instance(session_id, $S, 'server'),
+        Send($S, $C, 'SF', session_id), Reach('SF'),
+        RunningAuth($S,  'server', session_id, <ClientHello, ServerHello, EncryptedExtensions, <'20', ServerFinished>>, <psk_id_1, psk_1>),
+        Running($S, 'server', session_id, <ClientHello, ServerHello, EncryptedExtensions>, traffic_key) /* Used to ensure peer authentication, if a client has accepted a servers indentity, then a server must have sent their identity on a session equal to the one sent by the client*/ ]->
+      [ Out(<$S, $C, DTLSCipherTextSF>), /*server finished*/
+        St_ServerFinished($S, $C, session_id, <ClientHello, ServerHello, EncryptedExtensions, <'20', ServerFinished>>, <psk_id_1, psk_1>), 
+        ServerFinished(<$S, $C, <session_id, %next_seq, %next_epoch, %rec_seq, %rec_epoch>, hmac(<finished_key, h1(<ClientHello, ServerHello, EncryptedExtensions>)>), session_id, nonce, finished_key>),
+        FinalKey($S, $C, finished_key) ]
+
+
+rule ClientFinished:
+  let
+    /*************** INCOMMING: SERVERHELLO ****************/
+    ServerHello = 
+      <
+        /*ProtocolVersion*/ protocolVersion(), 
+        /*Random32*/ server_session_id, 
+        /*CipherSuite*/ 'CipherSuits', 
+        /*Extension*/ <
+          /*ExtensionType*/ '41', 
+          /*PreSharedKeyExtension*/ <
+            /*PskIdentity*/ <psk_id_1, obfuscated_ticket_age> 
+          >,
+          /*ExtensionType*/ '51', 
+          /*KeyshareServerHello*/ <'g', gb>
+        >
+      >
+
+    DTLSPlaintextSH = 
+      <
+        /*ContentType*/ '22',
+        /*epoch*/ %rec_epoch,
+        /*sequence_number*/ %rec_seq,
+        /*length*/ lenSH,
+        <
+          /*HandshakeType*/ '2', /*server_hello(2)*/
+          <lenSH, %rec_seq, 1:nat, 1:nat>,
+          ServerHello
+        >
+      >
+    /********************************************/
+    traffic_key = <gb^a, psk_1>
+    /********** INCOMMING: ENCRYPTEDEXTENSION **********/
+    EncryptedExtensions = 
+      <
+        /*Extension*/ <
+            /*ExtensionType*/ '13', 
+            /*EncryptedExtensions*/ 'encryptedExtensions'
+        >
+      >
+
+    DTLSCipherTextEE = 
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc{<
+          /*content*/ <
+            /*HandshakeType*/ '8', /*encrypted_extensions(8)*/
+            <lenEE, 1:nat, 1:nat, 1:nat>, 
+            EncryptedExtensions
+          >, 
+          /*zeros*/ <'0'>, 
+          /*ContentType*/ '22'
+        >}traffic_key
+      >
+    /******************************/
+
+    /********** INCOMMING: SERVERFINISHED **********/
+    ServerFinished = 
+      <
+        /*verify_data*/  server_finished
+      >
+
+    DTLSCipherTextSF = 
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc(<
+          /*content*/ <
+            /*HandshakeType*/ '20', /*finished(20)*/
+            <lenSF, 1:nat %+ 1:nat, 1:nat, 1:nat>, 
+            ServerFinished
+          >, 
+          /*zeros*/ <'0'>, 
+          /*ContentType*/ '22'
+        >, traffic_key)
+      >
+    /******************************/
+    
+    /********** CLIENTFINISHED **********/
+    finished_key =  HKDFExpand(<traffic_key, 'finished', 'Hash_length'>)
+
+    ClientFinished = 
+      <
+        /*verify_data*/  hmac(<finished_key, 
+                              h1(<ClientHello, <'2', ServerHello>, <'8', EncryptedExtensions>>)>)
+      >
+
+    DTLSCipherText =  
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc(<
+          /*content*/ <
+            /*HandshakeType*/ '20', /*finished(20)*/
+            <~msg_len, %next_seq, 1:nat, 1:nat>, 
+            ClientFinished
+          >, 
+          /*zeros*/ <'0', '0'>, 
+          /*ContentType*/ '22'
+        >, traffic_key)
+      >
+    /**********************************/
+  in
+    [ Fr(~msg_len),
+      St_ClientHello(<$C, $S, <a, psk_1>, session_id>, <ClientHello>, <session_id, %next_seq, %next_epoch, %rec_seq, %rec_epoch>),
+      In(<$S, $C, DTLSPlaintextSH>),
+      In(<$S, $C, DTLSCipherTextEE>),
+      In(<$S, $C, DTLSCipherTextSF>) ]
+  --[ HandshakeComplete($C, $S, 'client', traffic_key, <session_id, server_session_id>),
+      DHChal($C, session_id, 'g', a, 'g'^a, gb, gb^a),
+      Eq(ClientFinished, ServerFinished),
+      Neq('g', gb), Neq(gb, gb^a), /* Ensure gb is not DH_Neutral */
+      RunningAuth($C, 'client', session_id, <ClientHello, <'2', ServerHello>, <'8', EncryptedExtensions>, <'20', ServerFinished>>, <psk_id_1, psk_1>),
+      CommitAuth($C, $S, 'client', session_id, <ClientHello, <'2', ServerHello>, <'8', EncryptedExtensions>, <'20', ServerFinished>>, <psk_id_1, psk_1>),
+      Running($C, 'client', session_id, <ClientHello, <'2', ServerHello>, <'8', EncryptedExtensions>, <'20', ServerFinished>>, traffic_key),
+      Instance(session_id, $C, 'client'),
+      SessionKey($C, $S, 'client', session_id, traffic_key, 'auth') ]->
+    [ Out(<$C, $S, DTLSCipherText>),
+      !ClientSessionKey($C, $S, session_id, finished_key) ]
+
+// Ack
+rule Ack:
+  let
+    DTLSCipherText = 
+      <
+        /*unified_hdr*/ handshakeCryptoHeader(), 
+        /*encrypted_record*/ senc(<
+          /*content*/ <
+            /*HandshakeType*/ '20', /*finished(20)*/
+            <rec_len, %rec_seq, %off, %frag>, 
+            client_finished
+          >, 
+          /*zeros*/ <'0', '0'>, 
+          /*ContentType*/ '22'
+        >, traffic_key)
+      >
+  in
+      [ Fr(~data), Fr(~len),
+        In(<$C, $S, DTLSCipherText>),
+        !Keys(<$S, $C, session_id, gb, ga, traffic_key>),
+        St_ServerFinished($S, $C, session_id, <ClientHello, ServerHello, EncryptedExtensions, ServerFinished>, <psk_id_1, psk_1>),
+        ServerFinished(<$S, $C, <session_id, %next_seq, %next_epoch, %rec_seq, %rec_epoch>, server_finished, session_id, <client_session_id, session_id>, finished_key>) ]
+    --[ Eq(client_finished, server_finished), Reach('ACK'),
+        CommitAuth($S, $C, 'server', session_id, <ClientHello, ServerHello, EncryptedExtensions, ServerFinished>, <psk_id_1, psk_1>), 
+        HandshakeComplete($S, $C, 'server', traffic_key, <client_session_id, session_id>),
+        SessionKey($S, $C, 'server', session_id, traffic_key, 'auth'),
+        Instance(session_id, $S, 'server'),
+        Send($S, $C, 'ACK', session_id),
+        SendMsg($S, $C, ~data, finished_key, ~len) ]->
+      [ Out(senc(<~data, ~len>, finished_key)),
+        !ServerSessionKey($S, $C, session_id, finished_key) ]
+
+
+// Restriction to allow for equality checks
+restriction Equal:
+"
+  All x y #i.
+    Eq(x, y) @ #i ==> x = y
+"
+
+// Restriction made to allow for inequality checks
+restriction Not_equal:
+"
+  All x y #i.
+    Neq(x, y) @ #i ==> not(x = y)
+"
+
+lemma V1_Reachability_with_both_actors[use_induction]:
+  exists-trace
+  "Ex C S client_session_id server_session_id traffic_key #i #j #k #l. 
+    Start(C, S, 'client', client_session_id) @ i & Start(S, C, 'server', server_session_id) @ j
+    & HandshakeComplete(C, S, 'client', traffic_key, <client_session_id, server_session_id>) @ k & HandshakeComplete(S, C, 'server', traffic_key, <client_session_id, server_session_id>) @ l
+    & not(Ex #p. Corrupt(C) @ p) 
+    & not(Ex #q. Corrupt(S) @ q)
+    & not(Ex #r. K(traffic_key) @ r)
+  "
+
+/************** REUSE LEMMA ********************/
+lemma R6_only_one_start_per_tid[reuse]:
+"
+  All session_id actor1 actor2 peer1 peer2 role1 role2 #i #j.
+    Start(actor1, peer1, role1, session_id) @ i & Start(actor2, peer2, role2, session_id) @ j 
+      ==> #i = #j
+"
+
+lemma R8_one_dh_per_x[reuse]:
+"
+  All tid tid2 x actor actor2 #i #j.
+    DH(x, tid, actor) @ i & DH(x, tid2, actor2) @ j ==> #i = #j
+"
+
+lemma R7_dh_invariant[reuse]:
+"
+  All tid actor x #i. RevDHExp(x, tid, actor)@i ==>
+    Ex #j. DH(x, tid, actor)@j & #j < #i 
+"
+
+lemma R5_Session_id_invariant[reuse]:
+"
+  All session_id actor role #i.
+    Instance(session_id, actor, role) @ i
+      ==> (Ex peer #j. Start(actor, peer, role, session_id) @ j & (#j < #i))
+      
+"
+
+lemma dh_challenge[reuse]:
+"
+  All actor1 actor2 random1 random2 g a b ga gb gab #i #j #r.
+    DHChal(actor1, random1, g, a, ga, gb, gab) @ i 
+    & DHChal(actor2, random2, g, b, ga, gb, gab) @ j
+    & not(#i = #j)
+    & K(gab) @ r
+      ==> 
+        (Ex #p. RevDHExp(a, random1, actor1) @ p) | 
+        (Ex #q. RevDHExp(b, random2, actor2) @ q) |
+        (Ex #s. Corrupt(actor1) @ s) | 
+        (Ex #t. Corrupt(actor2) @ t) 
+"
+
+restriction R1_Only_one_session_per_pair_at_a_time:
+"
+  All actor1 actor2 role session_id1 session_id2 #i #j.
+    Start(actor1, actor2, role, session_id1) @ i & Start(actor1, actor2, role, session_id2) @ j & i < j
+      ==> Ex traffic_key #k. HandshakeComplete(actor1, actor2, role, traffic_key, <session_id1, session_id2>) @ k & k < j & i < k
+"
+
+restriction R2_Dont_essablish_session_with_self:
+"
+  All actor1 actor2 role session_id #i.
+    Start(actor1, actor2, role, session_id) @ #i & actor1 = actor2 ==> F
+"
+
+restriction R3_Dont_resend_messages:
+"
+  All actor1 actor2 msg_type session_id #i #j.
+    Send(actor1, actor2, msg_type, session_id) @ #i & Send(actor1, actor2, msg_type, session_id) @ #j ==> #i = #j
+"
+
+restriction R9_rev_dh_before_hs:
+"
+  All tid actor role hs session_id key x #i #j.
+    Running(actor, role, session_id, hs, key) @ j &
+    RevDHExp(x, tid, actor) @ i ==>
+    #i < #j
+"
+
+lemma H1_Establishing_the_same_session_keys:
+"
+  All C S client_session_id server_session_id keyC keyS #i #j.
+    HandshakeComplete(C, S, 'client', keyC, <client_session_id, server_session_id>) @ #i 
+    & HandshakeComplete(S, C, 'server', keyS, <client_session_id, server_session_id>) @ #j
+    & not(Ex #p. Corrupt(C) @ p) 
+    & not(Ex #q. Corrupt(S) @ q)
+      ==> keyC = keyS
+"
+
+lemma H2_Session_key_secrecy:
+"
+  All actor peer role session_id key #i #j.
+    SessionKey(actor, peer, role, session_id, key, 'auth') @ i 
+    & K(key) @ j
+     ==>
+      (Ex #p. Corrupt(actor) @ p)
+    | (Ex #q. Corrupt(peer) @ q)
+"
+
+//lemma H3_Authentication:
+//"
+//  All actor1 actor2 role1 session_id HandshakeHistory key #i.
+//    CommitAuth(actor1, actor2, role1, session_id, HandshakeHistory, key) @ i
+//    & not(Ex #p. Corrupt(actor1) @ p) 
+//    & not(Ex #q. Corrupt(actor2) @ q)
+//      ==> (Ex role2 #r. RunningAuth(actor2, role2, session_id, HandshakeHistory, key) @ r)
+//"
+
+lemma H3_Authentication:
+"
+  All actor1 actor2 role1 session_id1 HandshakeHistory key #i.
+    CommitAuth(actor1, actor2, role1, session_id1, HandshakeHistory, key) @ i
+    & not(Ex #p. Corrupt(actor1) @ p) 
+    & not(Ex #q. Corrupt(actor2) @ q)
+      ==> (Ex role2 session_id2 #r. RunningAuth(actor2, role2, session_id2, HandshakeHistory, key) @ r)
+"
+
+lemma H4_Unique_session_keys:
+"
+  All actor1 actor2 peer1 peer2 role key session_id1 session_id2 auth1 auth2 #i #j.
+    SessionKey(actor1, peer1, role, session_id1, key, auth1) @ i & SessionKey(actor2, peer2, role, session_id2, key, auth2) @ j
+      ==>
+        #i = #j
+        | (Ex #p. Corrupt(actor1) @ p)
+        | (Ex #q. Corrupt(actor2) @ q)
+        | (Ex #p. Corrupt(peer1) @ p)
+        | (Ex #q. Corrupt(peer2) @ q)
+"
+
+lemma H6_Forward_secrecy:
+"
+All C S key nonce #i #j.
+  HandshakeComplete(C, S, 'client', key, nonce) @ i 
+  & HandshakeComplete(S, C, 'server', key, nonce) @ j
+  & ((Ex #p. Corrupt(C) @ p & #j < #p) 
+  | (Ex #q. Corrupt(S) @ q & #j < #q))
+  & not((Ex #k. K(key) @ k & #k < #j))
+  ==>
+    not((Ex #k. K(key) @ k))
+"
+
+
+end
