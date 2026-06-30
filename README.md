@@ -1,6 +1,6 @@
 # DTLS-Tamarin-Models
 This repo contains Tamarin models for DTLS 1.3 along with proofs for the modeled security properties.
-The Tamarin Prover tool may be downloaded from their official website: [https://tamarin-prover.com/](https://tamarin-prover.com/). 
+The Tamarin Prover tool may be downloaded from the official website: [https://tamarin-prover.com/](https://tamarin-prover.com/). 
 
 ## Models
 In the Models folder, the models for the full handshake, PSK handshake, and record layer can be found.
